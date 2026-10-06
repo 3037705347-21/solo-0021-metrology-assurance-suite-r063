@@ -36,9 +36,17 @@ type DeviceResponse struct {
 	Device domain.Device `json:"device"`
 }
 
+type MeasurementView struct {
+	domain.Measurement
+	// Current is true exactly for the single reading that presently governs the
+	// case and its seal. Superseded readings remain in the list for the record
+	// but are always reported with Current=false.
+	Current bool `json:"current"`
+}
+
 type CaseResponse struct {
 	Case         domain.VerificationCase `json:"case"`
-	Measurements []domain.Measurement    `json:"measurements"`
+	Measurements []MeasurementView       `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`
 }

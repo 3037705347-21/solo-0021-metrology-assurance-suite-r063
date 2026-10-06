@@ -16,8 +16,6 @@ type Service struct {
 	now        func() time.Time
 }
 
-const pendingReplacementID = "pending-replacement"
-
 func NewService(repo *repository.Repository) *Service {
 	return &Service{
 		repository: repo,
@@ -205,6 +203,7 @@ func (s *Service) appendMeasurement(ctx context.Context, caseID string, input co
 func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest) (contracts.CaseResponse, error) {
 	id := strings.TrimSpace(caseID)
 	targetID := strings.TrimSpace(input.Replaces)
+	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		item, exists := m.Case(id)
 		if !exists {
@@ -223,25 +222,6 @@ func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input c
 		if target.IsSuperseded() {
 			return fmt.Errorf("%w: measurement %s is already replaced", domain.ErrStateConflict, target.ID)
 		}
-		item.ActiveMeasurementID = ""
-		if err := m.UpdateCase(item); err != nil {
-			return err
-		}
-		target.SupersededBy = pendingReplacementID
-		return m.ReplaceMeasurement(target)
-	})
-	if err != nil {
-		return contracts.CaseResponse{}, err
-	}
-	var result contracts.CaseResponse
-	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
-		item, exists := m.Case(id)
-		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
-		}
-		if item.State == domain.CaseSealed {
-			return fmt.Errorf("%w: case %s is sealed", domain.ErrStateConflict, item.ID)
-		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -254,19 +234,19 @@ func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input c
 		if err != nil {
 			return err
 		}
-		measurement.Replaces = targetID
+		measurement.Replaces = target.ID
 		if err := m.AppendMeasurement(measurement); err != nil {
 			return err
-		}
-		target, exists := m.Measurement(id, targetID)
-		if !exists {
-			return fmt.Errorf("%w: measurement %s", domain.ErrNotFound, targetID)
 		}
 		target.SupersededBy = measurement.ID
 		if err := m.ReplaceMeasurement(target); err != nil {
 			return err
 		}
-		item.AttachReading(measurement.ID, s.now())
+		// The domain transition recomputes review_ready vs recheck_required
+		// from the new reading's acceptance result.
+		if err := item.ReplaceMeasurement(measurement.ID, measurement.Accepted, s.now()); err != nil {
+			return err
+		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
@@ -340,7 +320,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
-		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
+		measurement, ok := currentAcceptedMeasurement(m, item)
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
@@ -385,36 +365,57 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
-func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
-	var selected domain.Measurement
-	found := false
-	for _, item := range items {
-		if !item.Accepted {
-			continue
-		}
-		if !found || item.AbsoluteDeviation() < selected.AbsoluteDeviation() {
-			selected = item
-			found = true
-		}
+// currentAcceptedMeasurement returns the one reading that governs the case:
+// the case's active measurement, which must still be un-superseded and
+// accepted. Replaced-away readings are retained for the record but can never
+// seal a case.
+func currentAcceptedMeasurement(m *repository.Mutation, item domain.VerificationCase) (domain.Measurement, bool) {
+	currentID := strings.TrimSpace(item.ActiveMeasurementID)
+	if currentID == "" {
+		return domain.Measurement{}, false
 	}
-	return selected, found
-}
-
-func activeAcceptedMeasurement(m *repository.Mutation, item domain.VerificationCase) (domain.Measurement, bool) {
-	current, exists := m.Measurement(item.ID, item.ActiveMeasurementID)
+	current, exists := m.Measurement(item.ID, currentID)
 	if !exists {
 		return domain.Measurement{}, false
 	}
-	if current.IsSuperseded() || !current.Accepted {
+	if current.IsSuperseded() || current.SupersededBy != "" || !current.Accepted {
 		return domain.Measurement{}, false
 	}
 	return current, true
 }
 
+func measurementViews(m *repository.Mutation, item domain.VerificationCase) []contracts.MeasurementView {
+	items := m.Measurements(item.ID)
+	views := make([]contracts.MeasurementView, 0, len(items))
+	activeID := strings.TrimSpace(item.ActiveMeasurementID)
+	for _, reading := range items {
+		isCurrent := reading.ID == activeID && !reading.IsSuperseded()
+		views = append(views, contracts.MeasurementView{
+			Measurement: reading,
+			Current:     isCurrent,
+		})
+	}
+	return views
+}
+
+func measurementViewsFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) []contracts.MeasurementView {
+	items := snapshot.Measurements(item.ID)
+	views := make([]contracts.MeasurementView, 0, len(items))
+	activeID := strings.TrimSpace(item.ActiveMeasurementID)
+	for _, reading := range items {
+		isCurrent := reading.ID == activeID && !reading.IsSuperseded()
+		views = append(views, contracts.MeasurementView{
+			Measurement: reading,
+			Current:     isCurrent,
+		})
+	}
+	return views
+}
+
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
-		Measurements: m.Measurements(item.ID),
+		Measurements: measurementViews(m, item),
 		Events:       m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
@@ -426,7 +427,7 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
-		Measurements: snapshot.Measurements(item.ID),
+		Measurements: measurementViewsFromSnapshot(snapshot, item),
 		Events:       snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {

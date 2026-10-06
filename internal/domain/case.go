@@ -94,12 +94,6 @@ func (c *VerificationCase) ReplaceMeasurement(measurementID string, accepted boo
 	return nil
 }
 
-func (c *VerificationCase) AttachReading(measurementID string, at time.Time) {
-	c.ActiveMeasurementID = strings.TrimSpace(measurementID)
-	c.Version++
-	c.UpdatedAt = at.UTC()
-}
-
 func (c *VerificationCase) adoptReading(measurementID string, accepted bool, at time.Time) {
 	c.ActiveMeasurementID = strings.TrimSpace(measurementID)
 	if accepted {

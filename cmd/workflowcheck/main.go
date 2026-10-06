@@ -38,6 +38,7 @@ func main() {
 		"register-device":          checkRegisterDevice,
 		"open-verification-case":   checkOpenVerificationCase,
 		"record-measurement":       checkRecordMeasurement,
+		"replace-measurement":      checkReplaceMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
 	}
@@ -240,6 +241,434 @@ func checkRecordMeasurement() error {
 	}
 	if rejectedValue {
 		return errors.New("out-of-tolerance measurement was accepted")
+	}
+	return nil
+}
+
+func checkReplaceMeasurement() error {
+	// Case 1: an out-of-tolerance reading is corrected to an in-tolerance one.
+	// The case must leave recheck_required and become ready to seal, and the
+	// resulting seal must cite the new reading.
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.rejectedCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	badRead, err := h.getCase(caseID)
+	if err != nil {
+		return err
+	}
+	badID, err := nestedString(badRead.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+
+	corrected, err := h.replaceMeasurement(caseID, 25.1, "Rui", badID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(corrected, http.StatusCreated); err != nil {
+		return err
+	}
+	state, err := nestedString(corrected.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "review_ready" {
+		return fmt.Errorf("rejected->accepted replacement state = %q, want review_ready", state)
+	}
+	measurements, err := nestedSlice(corrected.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 2 {
+		return fmt.Errorf("replacement removed history: %d readings, want 2", len(measurements))
+	}
+	if err := expectOnlyCurrentReading(corrected.Body); err != nil {
+		return err
+	}
+	goodID, err := nestedString(corrected.Body, "measurements", 1, "id")
+	if err != nil {
+		return err
+	}
+	oldSuperseded, err := nestedString(corrected.Body, "measurements", 0, "superseded_by")
+	if err != nil {
+		return err
+	}
+	if oldSuperseded != goodID {
+		return fmt.Errorf("old reading superseded_by = %q, want %q", oldSuperseded, goodID)
+	}
+	newReplaces, err := nestedString(corrected.Body, "measurements", 1, "replaces")
+	if err != nil {
+		return err
+	}
+	if newReplaces != badID {
+		return fmt.Errorf("new reading replaces = %q, want %q", newReplaces, badID)
+	}
+	activeID, err := nestedString(corrected.Body, "case", "active_measurement_id")
+	if err != nil {
+		return err
+	}
+	if activeID != goodID {
+		return fmt.Errorf("active_measurement_id = %q, want %q", activeID, goodID)
+	}
+	if !hasEvent(corrected.Body, "measurement_replaced") {
+		return errors.New("replacement audit event is missing")
+	}
+
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Verifier",
+		"summary":  "corrected reading sealed",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealedMeasurement, err := nestedString(sealed.Body, "seal", "measurement_id")
+	if err != nil {
+		return err
+	}
+	if sealedMeasurement != goodID {
+		return fmt.Errorf("seal cites %q, want current reading %q", sealedMeasurement, goodID)
+	}
+	// The replaced-away reading must still be fully present in the sealed record.
+	if err := expectOnlyCurrentReading(sealed.Body); err != nil {
+		return err
+	}
+	replacedSealAfter, err := h.replaceMeasurement(caseID, 25.0, "Rui", goodID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(replacedSealAfter, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(replacedSealAfter, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Case 2: an accepted reading is "corrected" to an out-of-tolerance one.
+	// The case must leave review_ready and refuse to seal.
+	h2 := newHarness()
+	defer h2.close()
+
+	caseID2, err := h2.readyCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	goodRead, err := h2.getCase(caseID2)
+	if err != nil {
+		return err
+	}
+	originalID, err := nestedString(goodRead.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+	degraded, err := h2.replaceMeasurement(caseID2, 26.5, "Rui", originalID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(degraded, http.StatusCreated); err != nil {
+		return err
+	}
+	state2, err := nestedString(degraded.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state2 != "recheck_required" {
+		return fmt.Errorf("accepted->rejected replacement state = %q, want recheck_required", state2)
+	}
+	if err := expectOnlyCurrentReading(degraded.Body); err != nil {
+		return err
+	}
+	sealRejected, err := h2.request(http.MethodPost, "/cases/"+caseID2+"/seal", map[string]any{
+		"reviewer": "Verifier",
+		"summary":  "must not seal a recheck case",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealRejected, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(sealRejected, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Case 3: a replacement that does not hold must leave the case untouched.
+	h3 := newHarness()
+	defer h3.close()
+
+	caseID3, err := h3.readyCase("MET-1503")
+	if err != nil {
+		return err
+	}
+	before, err := h3.getCase(caseID3)
+	if err != nil {
+		return err
+	}
+	beforeVersion, err := nestedFloat(before.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	beforeRead, err := nestedString(before.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+
+	missing, err := h3.replaceMeasurement(caseID3, 25.0, "Rui", "measurement-9999")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusNotFound); err != nil {
+		return err
+	}
+	invalid, err := h3.request(http.MethodPost, "/cases/"+caseID3+"/measurements", map[string]any{
+		"observed":   25.0,
+		"technician": "   ",
+		"replaces":   beforeRead,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(invalid, "invalid_input"); err != nil {
+		return err
+	}
+	after, err := h3.getCase(caseID3)
+	if err != nil {
+		return err
+	}
+	afterVersion, err := nestedFloat(after.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	if afterVersion != beforeVersion {
+		return fmt.Errorf("rejected replacement changed case version: %v -> %v", beforeVersion, afterVersion)
+	}
+	afterState, err := nestedString(after.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if afterState != "review_ready" {
+		return fmt.Errorf("rejected replacement changed case state to %q", afterState)
+	}
+	afterMeasurements, err := nestedSlice(after.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(afterMeasurements) != 1 {
+		return fmt.Errorf("rejected replacement left %d readings, want 1", len(afterMeasurements))
+	}
+	if afterMeasurements[0].(map[string]any)["id"] != beforeRead {
+		return errors.New("rejected replacement changed the current reading")
+	}
+	if marked, _ := afterMeasurements[0].(map[string]any)["superseded_by"].(string); marked != "" {
+		return fmt.Errorf("rejected replacement marked the reading superseded: %q", marked)
+	}
+
+	// Case 4: replacement and seal submitted simultaneously must always settle
+	// in one coherent result: at most one seal, and if a seal exists it cites
+	// the single current reading. Repeated for both acceptance directions and
+	// many iterations because the repository lock serializes the two commits in
+	// either order.
+	cases := []struct {
+		tag      string
+		observed float64
+		accepted bool
+	}{
+		{"MET-1510", 24.9, true},
+		{"MET-1530", 26.5, false},
+	}
+	for _, scenario := range cases {
+		for attempt := 0; attempt < 10; attempt++ {
+			hr := newHarness()
+			caseIDr, err := hr.readyCase(fmt.Sprintf("%s-%02d", scenario.tag, attempt))
+			if err != nil {
+				hr.close()
+				return err
+			}
+			currentRead, err := hr.getCase(caseIDr)
+			if err != nil {
+				hr.close()
+				return err
+			}
+			replaceID, err := nestedString(currentRead.Body, "measurements", 0, "id")
+			if err != nil {
+				hr.close()
+				return err
+			}
+			type outcome struct {
+				response apiResponse
+				err      error
+			}
+			results := make(chan outcome, 2)
+			var wait sync.WaitGroup
+			wait.Add(2)
+			go func() {
+				defer wait.Done()
+				response, err := hr.request(http.MethodPost, "/cases/"+caseIDr+"/seal", map[string]any{
+					"reviewer": "Verifier",
+					"summary":  "seal raced against replacement",
+				})
+				results <- outcome{response: response, err: err}
+			}()
+			go func() {
+				defer wait.Done()
+				response, err := hr.replaceMeasurement(caseIDr, scenario.observed, "Rui", replaceID)
+				results <- outcome{response: response, err: err}
+			}()
+			wait.Wait()
+			close(results)
+
+			sealCreated := 0
+			replacementCreated := 0
+			for item := range results {
+				if item.err != nil {
+					hr.close()
+					return item.err
+				}
+				if item.response.Status != http.StatusCreated && item.response.Status != http.StatusConflict {
+					hr.close()
+					return fmt.Errorf("raced operation returned status %d: %s", item.response.Status, item.response.Raw)
+				}
+				if item.response.Status != http.StatusCreated {
+					continue
+				}
+				if _, hasSeal := item.response.Body["seal"]; hasSeal {
+					sealCreated++
+				} else {
+					replacementCreated++
+				}
+			}
+			if sealCreated > 1 {
+				hr.close()
+				return fmt.Errorf("%s attempt %d: %d seals were created", scenario.tag, attempt, sealCreated)
+			}
+			if replacementCreated > 1 {
+				hr.close()
+				return fmt.Errorf("%s attempt %d: replacement applied more than once", scenario.tag, attempt)
+			}
+			if sealCreated == 0 && replacementCreated == 0 {
+				hr.close()
+				return fmt.Errorf("%s attempt %d: both raced operations were rejected", scenario.tag, attempt)
+			}
+			final, err := hr.getCase(caseIDr)
+			hr.close()
+			if err != nil {
+				return err
+			}
+			if err := expectCoherentFinalState(final.Body, scenario.accepted); err != nil {
+				return fmt.Errorf("%s attempt %d: %w", scenario.tag, attempt, err)
+			}
+		}
+	}
+	return nil
+}
+
+func expectOnlyCurrentReading(body map[string]any) error {
+	measurements, err := nestedSlice(body, "measurements")
+	if err != nil {
+		return err
+	}
+	current := 0
+	var currentID string
+	for _, item := range measurements {
+		reading, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("measurement entry is not an object")
+		}
+		flag, _ := reading["current"].(bool)
+		if flag {
+			current++
+			currentID, _ = reading["id"].(string)
+			if marked, _ := reading["superseded_by"].(string); marked != "" {
+				return errors.New("the current reading is marked superseded")
+			}
+			continue
+		}
+		if marked, _ := reading["superseded_by"].(string); marked == "" {
+			return errors.New("an archived reading is not marked superseded")
+		}
+	}
+	if current != 1 {
+		return fmt.Errorf("expected exactly one current reading, found %d", current)
+	}
+	activeID, err := nestedString(body, "case", "active_measurement_id")
+	if err != nil {
+		return err
+	}
+	if activeID != currentID {
+		return fmt.Errorf("active_measurement_id %q does not match current reading %q", activeID, currentID)
+	}
+	return nil
+}
+
+func expectCoherentFinalState(body map[string]any, replacementAccepted bool) error {
+	state, err := nestedString(body, "case", "state")
+	if err != nil {
+		return err
+	}
+	measurements, err := nestedSlice(body, "measurements")
+	if err != nil {
+		return err
+	}
+	currentCount := 0
+	var currentReading map[string]any
+	for _, item := range measurements {
+		reading, ok := item.(map[string]any)
+		if !ok {
+			return errors.New("measurement entry is not an object")
+		}
+		if marked, _ := reading["superseded_by"].(string); marked == "pending-replacement" {
+			return errors.New("a reading is left in a pending replacement state")
+		}
+		if flag, _ := reading["current"].(bool); flag {
+			currentCount++
+			currentReading = reading
+		}
+	}
+	if currentCount != 1 {
+		return fmt.Errorf("final state has %d current readings, want 1", currentCount)
+	}
+	activeID, err := nestedString(body, "case", "active_measurement_id")
+	if err != nil {
+		return err
+	}
+	currentID, _ := currentReading["id"].(string)
+	if activeID != currentID {
+		return fmt.Errorf("active_measurement_id %q does not match current reading %q", activeID, currentID)
+	}
+	sealBody, sealExists := body["seal"].(map[string]any)
+	switch state {
+	case "sealed":
+		if !sealExists {
+			return errors.New("sealed case has no evidence seal")
+		}
+		sealedID, _ := sealBody["measurement_id"].(string)
+		if sealedID != currentID {
+			return fmt.Errorf("seal cites %q while current reading is %q", sealedID, currentID)
+		}
+		if accepted, _ := currentReading["accepted"].(bool); !accepted {
+			return errors.New("sealed case is backed by an out-of-tolerance reading")
+		}
+	case "recheck_required":
+		if replacementAccepted {
+			return errors.New("in-tolerance replacement settled in recheck_required")
+		}
+		if sealExists {
+			return errors.New("a recheck_required case carries an evidence seal")
+		}
+		if accepted, _ := currentReading["accepted"].(bool); accepted {
+			return errors.New("recheck_required case is backed by an accepted reading")
+		}
+	default:
+		return fmt.Errorf("raced outcome settled in unexpected state %q", state)
 	}
 	return nil
 }
@@ -463,6 +892,18 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 	})
 }
 
+func (h *harness) replaceMeasurement(caseID string, observed float64, technician, replaces string) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
+		"observed":   observed,
+		"technician": technician,
+		"replaces":   replaces,
+	})
+}
+
+func (h *harness) getCase(caseID string) (apiResponse, error) {
+	return h.request(http.MethodGet, "/cases/"+caseID, nil)
+}
+
 func (h *harness) rejectedCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
@@ -527,14 +968,14 @@ func expectErrorCode(response apiResponse, expected string) error {
 	return nil
 }
 
-func nestedString(root map[string]any, path ...string) (string, error) {
-	value, err := nestedValue(root, path...)
+func nestedString(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
 	if err != nil {
 		return "", err
 	}
 	text, ok := value.(string)
 	if !ok {
-		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }
@@ -549,6 +990,18 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedFloat(root map[string]any, path ...string) (float64, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s is not a number", strings.Join(path, "."))
+	}
+	return number, nil
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {
