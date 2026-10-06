@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "name": "metrology-assurance-suite",
+  "project_shape": "backend",
+  "language": "go",
+  "modules": [
+    {
+      "id": "entrypoint",
+      "path": "cmd/metrology-service",
+      "responsibility": "HTTP process entrypoint, listener configuration, and graceful shutdown"
+    },
+    {
+      "id": "runtimecheck",
+      "path": "cmd/workflowcheck",
+      "responsibility": "bounded public-API workflow checks for local verification"
+    },
+    {
+      "id": "httpapi",
+      "path": "internal/httpapi",
+      "responsibility": "routing, JSON decoding, and stable status mapping"
+    },
+    {
+      "id": "assurance",
+      "path": "internal/assurance",
+      "responsibility": "workflow orchestration and atomic decisions"
+    },
+    {
+      "id": "domain",
+      "path": "internal/domain",
+      "responsibility": "entities, invariants, and state transitions"
+    },
+    {
+      "id": "repository",
+      "path": "internal/repository",
+      "responsibility": "mutex-protected in-memory persistence with copy-on-write commits"
+    },
+    {
+      "id": "contracts",
+      "path": "internal/contracts",
+      "responsibility": "public request and response models"
+    },
+    {
+      "id": "bootstrap",
+      "path": "internal/bootstrap",
+      "responsibility": "concrete dependency wiring for server and workflow checks"
+    }
+  ],
+  "workflows": [
+    {
+      "id": "register-device",
+      "name": "Register device",
+      "entry": "POST /devices",
+      "steps": [
+        "decode and validate the device request",
+        "normalize the asset tag and reject a duplicate identity",
+        "commit the active device and its audit event"
+      ],
+      "success": "returns the registered device and a readable snapshot",
+      "failure": "returns stable validation or duplicate asset-tag errors",
+      "verification": "workflowcheck registers a device, reads it, and rejects a duplicate tag",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "open-verification-case",
+      "name": "Open verification case",
+      "entry": "POST /cases",
+      "steps": [
+        "verify the device exists and is active",
+        "reject a second unfinished case for the same device",
+        "open one waiting case with a nominal value and tolerance"
+      ],
+      "success": "returns an awaiting_measurement case",
+      "failure": "returns not-found or active-case conflict errors",
+      "verification": "workflowcheck opens and reads a case, then rejects a concurrent second case",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "record-measurement",
+      "name": "Record measurement",
+      "entry": "POST /cases/{id}/measurements",
+      "steps": [
+        "load the waiting case and compute signed deviation",
+        "accept an in-tolerance measurement or require a repeat",
+        "commit the measurement and case transition together"
+      ],
+      "success": "returns a review_ready or recheck_required case",
+      "failure": "returns conflict when the case is not awaiting measurement",
+      "verification": "workflowcheck records both accepted and rejected measurements",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "reopen-verification-case",
+      "name": "Reopen verification case",
+      "entry": "POST /cases/{id}/reopen",
+      "steps": [
+        "verify the case is in recheck_required",
+        "record the actor and reason",
+        "return the case to awaiting_measurement"
+      ],
+      "success": "returns the reopened case and a new audit event",
+      "failure": "returns conflict for any other case state",
+      "verification": "workflowcheck fails a measurement, reopens the case, and rejects a second reopen",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
+      "id": "seal-verification",
+      "name": "Seal verification",
+      "entry": "POST /cases/{id}/seal",
+      "steps": [
+        "verify the case is ready for review",
+        "select the accepted measurement with the smallest deviation",
+        "create exactly one seal and make the case terminal"
+      ],
+      "success": "returns a sealed case and one evidence seal",
+      "failure": "returns conflict for a non-reviewable case or a duplicate seal",
+      "verification": "workflowcheck races two seal requests and verifies exactly one succeeds",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    }
+  ],
+  "complexity": {
+    "mechanisms": [
+      "state_transition",
+      "resource_lifetime",
+      "error_propagation",
+      "concurrency"
+    ],
+    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic."
+  }
+}

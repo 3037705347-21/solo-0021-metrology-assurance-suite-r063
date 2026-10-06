@@ -1,0 +1,35 @@
+{
+  "language": "go",
+  "project_shape": "backend",
+  "source_extensions": [
+    ".go"
+  ],
+  "build_command": "go build ./...",
+  "testing": "deferred",
+  "service": {
+    "run_command": "go run ./cmd/metrology-service --addr 127.0.0.1:18121",
+    "health_url": "http://127.0.0.1:18121/healthz"
+  },
+  "workflow_checks": [
+    {
+      "workflow_id": "register-device",
+      "command": "go run ./cmd/workflowcheck --workflow register-device"
+    },
+    {
+      "workflow_id": "open-verification-case",
+      "command": "go run ./cmd/workflowcheck --workflow open-verification-case"
+    },
+    {
+      "workflow_id": "record-measurement",
+      "command": "go run ./cmd/workflowcheck --workflow record-measurement"
+    },
+    {
+      "workflow_id": "reopen-verification-case",
+      "command": "go run ./cmd/workflowcheck --workflow reopen-verification-case"
+    },
+    {
+      "workflow_id": "seal-verification",
+      "command": "go run ./cmd/workflowcheck --workflow seal-verification"
+    }
+  ]
+}

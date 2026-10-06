@@ -1,0 +1,194 @@
+{
+  "task_source_schema_version": 1,
+  "entities": [
+    {
+      "id": "device",
+      "label": "Device",
+      "relations": [
+        "verification_case.device_id belongs_to device.id",
+        "evidence_seal.device_id belongs_to device.id"
+      ],
+      "invariants": [
+        "asset tag is unique after trim and upper-casing",
+        "retired is terminal",
+        "an active device can have at most one unfinished case"
+      ]
+    },
+    {
+      "id": "verification_case",
+      "label": "Verification case",
+      "relations": [
+        "measurement.case_id belongs_to verification_case.id",
+        "evidence_seal.case_id belongs_to verification_case.id"
+      ],
+      "invariants": [
+        "tolerance is positive",
+        "only awaiting_measurement accepts measurements",
+        "sealed is terminal",
+        "version increases on every state change"
+      ]
+    },
+    {
+      "id": "measurement",
+      "label": "Measurement",
+      "relations": [
+        "measurement.case_id belongs_to verification_case.id"
+      ],
+      "invariants": [
+        "deviation equals observed minus nominal",
+        "accepted is true exactly when absolute deviation is within tolerance",
+        "technician and timestamp are immutable"
+      ]
+    },
+    {
+      "id": "evidence_seal",
+      "label": "Evidence seal",
+      "relations": [
+        "evidence_seal.case_id belongs_to verification_case.id",
+        "evidence_seal.measurement_id belongs_to measurement.id"
+      ],
+      "invariants": [
+        "one case has at most one seal",
+        "only an accepted measurement may be selected",
+        "the smallest absolute deviation wins when several accepted measurements exist"
+      ]
+    }
+  ],
+  "state_machines": [
+    {
+      "subject": "device",
+      "states": [
+        "active",
+        "retired"
+      ],
+      "transitions": [
+        "active->retired"
+      ],
+      "invariants": [
+        "retired devices cannot open new cases"
+      ]
+    },
+    {
+      "subject": "verification_case",
+      "states": [
+        "awaiting_measurement",
+        "review_ready",
+        "recheck_required",
+        "sealed"
+      ],
+      "transitions": [
+        "awaiting_measurement->review_ready",
+        "awaiting_measurement->recheck_required",
+        "recheck_required->awaiting_measurement",
+        "review_ready->sealed"
+      ],
+      "invariants": [
+        "sealed does not transition again",
+        "each transition increments version",
+        "case mutation and audit event share one atomic commit"
+      ]
+    }
+  ],
+  "capability_families": [
+    {
+      "family": "state machine and transitions",
+      "occupied_by": [
+        "verification_case_lifecycle"
+      ],
+      "available": false
+    },
+    {
+      "family": "concurrency and locks",
+      "occupied_by": [
+        "repository_mutation_lock"
+      ],
+      "available": true
+    },
+    {
+      "family": "resource lifetime",
+      "occupied_by": [
+        "single_active_case_and_terminal_seal"
+      ],
+      "available": true
+    },
+    {
+      "family": "error propagation",
+      "occupied_by": [
+        "stable_http_error_contract"
+      ],
+      "available": true
+    },
+    {
+      "family": "recovery and rollback",
+      "occupied_by": [],
+      "available": true
+    },
+    {
+      "family": "export and freeze",
+      "occupied_by": [],
+      "available": true
+    },
+    {
+      "family": "batch mutations",
+      "occupied_by": [],
+      "available": true
+    }
+  ],
+  "extension_seams": [
+    {
+      "id": "event-replay",
+      "anchor": "AuditEvent sequence on a verification case",
+      "entry": "GET /cases/{id}/events",
+      "distinct_outcome": "return a deterministic timeline with state and actor boundaries",
+      "mechanism": "ordered_projection"
+    },
+    {
+      "id": "case-amendment",
+      "anchor": "sealed case version and evidence seal",
+      "entry": "POST /cases/{id}/seal",
+      "distinct_outcome": "add a compensating amendment record without mutating the sealed evidence",
+      "mechanism": "compensating_lifecycle"
+    },
+    {
+      "id": "device-retirement",
+      "anchor": "active device state and unfinished cases",
+      "entry": "GET /devices/{id}",
+      "distinct_outcome": "retire a device only when no case is unfinished and keep historical cases readable",
+      "mechanism": "guarded_state_transition"
+    },
+    {
+      "id": "review-packet-freeze",
+      "anchor": "case view with measurements and seal",
+      "entry": "GET /cases/{id}",
+      "distinct_outcome": "produce an immutable snapshot identity from the sealed case version",
+      "mechanism": "deterministic_recompute"
+    }
+  ],
+  "tension_points": [
+    {
+      "workflow_id": "register-device",
+      "description": "Asset tags can be treated as case-sensitive labels or globally normalized identities; only the normalized interpretation prevents duplicate devices",
+      "observable_failure": "two devices appear with tags that differ only by case or surrounding whitespace"
+    },
+    {
+      "workflow_id": "open-verification-case",
+      "description": "Unfinished case detection can inspect only the current request or all historical records; only scanning every non-terminal case prevents duplicate concurrent work",
+      "observable_failure": "one device has two simultaneous awaiting or reviewable cases"
+    },
+    {
+      "workflow_id": "record-measurement",
+      "description": "Acceptance can compare a rounded display value or the full floating-point deviation; only the full deviation preserves the tolerance boundary",
+      "observable_failure": "a boundary value is accepted while its computed absolute deviation is greater than tolerance"
+    },
+    {
+      "workflow_id": "reopen-verification-case",
+      "description": "Reopening can preserve the rejected measurement history or replace it; preserving history is required for an audit trail while still allowing a new measurement",
+      "observable_failure": "a reopen erases the failed measurement or permits reopening a sealed case"
+    },
+    {
+      "workflow_id": "seal-verification",
+      "description": "Concurrent reviewers may both observe a ready case; only an atomic commit that rechecks state and seal uniqueness permits one seal",
+      "observable_failure": "two seals are created, or the response claims success while no sealed case is readable"
+    }
+  ]
+}
