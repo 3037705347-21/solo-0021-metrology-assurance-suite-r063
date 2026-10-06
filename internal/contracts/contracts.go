@@ -36,9 +36,18 @@ type DeviceResponse struct {
 	Device domain.Device `json:"device"`
 }
 
+// MeasurementView pairs a stored measurement with its current-reading flag.
+// Exactly one reading in an unsealed case is current: the case conclusion and
+// the evidence seal derive from it alone. Superseded readings remain fully
+// present in the view for traceability but are marked current=false.
+type MeasurementView struct {
+	domain.Measurement
+	Current bool `json:"current"`
+}
+
 type CaseResponse struct {
 	Case         domain.VerificationCase `json:"case"`
-	Measurements []domain.Measurement    `json:"measurements"`
+	Measurements []MeasurementView       `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`
 }

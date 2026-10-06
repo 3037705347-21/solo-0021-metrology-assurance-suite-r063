@@ -16,8 +16,6 @@ type Service struct {
 	now        func() time.Time
 }
 
-const pendingReplacementID = "pending-replacement"
-
 func NewService(repo *repository.Repository) *Service {
 	return &Service{
 		repository: repo,
@@ -205,6 +203,15 @@ func (s *Service) appendMeasurement(ctx context.Context, caseID string, input co
 func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest) (contracts.CaseResponse, error) {
 	id := strings.TrimSpace(caseID)
 	targetID := strings.TrimSpace(input.Replaces)
+	if targetID == "" {
+		return contracts.CaseResponse{}, fmt.Errorf("%w: replaces must reference a reading", domain.ErrInvalidInput)
+	}
+	var result contracts.CaseResponse
+	// The whole replacement is one atomic commit. Validating and building
+	// every artifact before the first store means a rejected replacement
+	// (unknown reading, already-superseded reading, bad input, case sealed
+	// concurrently) rolls back completely: no pending marker, no detached
+	// active reading, no audit event.
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		item, exists := m.Case(id)
 		if !exists {
@@ -213,7 +220,7 @@ func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input c
 		if item.State == domain.CaseSealed {
 			return fmt.Errorf("%w: case %s is sealed", domain.ErrStateConflict, item.ID)
 		}
-		target, exists := m.Measurement(id, targetID)
+		target, exists := m.Measurement(item.ID, targetID)
 		if !exists {
 			return fmt.Errorf("%w: measurement %s", domain.ErrNotFound, targetID)
 		}
@@ -223,26 +230,7 @@ func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input c
 		if target.IsSuperseded() {
 			return fmt.Errorf("%w: measurement %s is already replaced", domain.ErrStateConflict, target.ID)
 		}
-		item.ActiveMeasurementID = ""
-		if err := m.UpdateCase(item); err != nil {
-			return err
-		}
-		target.SupersededBy = pendingReplacementID
-		return m.ReplaceMeasurement(target)
-	})
-	if err != nil {
-		return contracts.CaseResponse{}, err
-	}
-	var result contracts.CaseResponse
-	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
-		item, exists := m.Case(id)
-		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
-		}
-		if item.State == domain.CaseSealed {
-			return fmt.Errorf("%w: case %s is sealed", domain.ErrStateConflict, item.ID)
-		}
-		measurement, err := domain.NewMeasurement(
+		replacement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
 			input.Observed,
@@ -254,30 +242,37 @@ func (s *Service) replaceMeasurement(ctx context.Context, caseID string, input c
 		if err != nil {
 			return err
 		}
-		measurement.Replaces = targetID
-		if err := m.AppendMeasurement(measurement); err != nil {
+		replacement.Replaces = target.ID
+		// Recompute the case conclusion from the replacement's acceptance
+		// decision and adopt the replacement as the sole current reading.
+		if err := item.ReplaceMeasurement(replacement.ID, replacement.Accepted, s.now()); err != nil {
 			return err
 		}
-		target, exists := m.Measurement(id, targetID)
-		if !exists {
-			return fmt.Errorf("%w: measurement %s", domain.ErrNotFound, targetID)
-		}
-		target.SupersededBy = measurement.ID
+		target.SupersededBy = replacement.ID
 		if err := m.ReplaceMeasurement(target); err != nil {
 			return err
 		}
-		item.AttachReading(measurement.ID, s.now())
+		if err := m.AppendMeasurement(replacement); err != nil {
+			return err
+		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
+		}
+		kind := "measurement_replaced"
+		detail := fmt.Sprintf("reading %s was superseded by corrected reading %s", target.ID, replacement.ID)
+		if replacement.Accepted {
+			detail += "; corrected reading is within tolerance and ready for review"
+		} else {
+			detail += "; corrected reading exceeded tolerance and requires another measurement"
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
 			item.ID,
 			item.ID,
-			"measurement_replaced",
-			measurement.Technician,
-			"a corrected reading replaced the previous reading",
+			kind,
+			replacement.Technician,
+			detail,
 			s.now(),
 		)
 		if err != nil {
@@ -340,9 +335,13 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
-		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
+		// Only the single current, non-superseded reading may support the
+		// seal. Replaced readings stay on file for traceability but never
+		// back a conclusion, so the seal cannot reference a stale reading
+		// even when it had a smaller deviation.
+		measurement, ok := activeAcceptedMeasurement(m, item)
 		if !ok {
-			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
+			return fmt.Errorf("%w: an accepted current measurement is required before sealing", domain.ErrStateConflict)
 		}
 		if err := item.Seal(s.now()); err != nil {
 			return err
@@ -385,21 +384,6 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
-func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
-	var selected domain.Measurement
-	found := false
-	for _, item := range items {
-		if !item.Accepted {
-			continue
-		}
-		if !found || item.AbsoluteDeviation() < selected.AbsoluteDeviation() {
-			selected = item
-			found = true
-		}
-	}
-	return selected, found
-}
-
 func activeAcceptedMeasurement(m *repository.Mutation, item domain.VerificationCase) (domain.Measurement, bool) {
 	current, exists := m.Measurement(item.ID, item.ActiveMeasurementID)
 	if !exists {
@@ -411,10 +395,21 @@ func activeAcceptedMeasurement(m *repository.Mutation, item domain.VerificationC
 	return current, true
 }
 
+func measurementViews(items []domain.Measurement, activeID string) []contracts.MeasurementView {
+	views := make([]contracts.MeasurementView, 0, len(items))
+	for _, item := range items {
+		views = append(views, contracts.MeasurementView{
+			Measurement: item,
+			Current:     item.ID == activeID && !item.IsSuperseded(),
+		})
+	}
+	return views
+}
+
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
-		Measurements: m.Measurements(item.ID),
+		Measurements: measurementViews(m.Measurements(item.ID), item.ActiveMeasurementID),
 		Events:       m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
@@ -426,7 +421,7 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
 		Case:         item,
-		Measurements: snapshot.Measurements(item.ID),
+		Measurements: measurementViews(snapshot.Measurements(item.ID), item.ActiveMeasurementID),
 		Events:       snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {

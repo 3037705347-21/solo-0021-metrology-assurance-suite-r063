@@ -83,6 +83,11 @@ func (c *VerificationCase) RecordMeasurement(accepted bool, measurementID string
 	return nil
 }
 
+// ReplaceMeasurement adopts a corrected reading in place of the current one.
+// The case conclusion is recomputed from the replacement's acceptance
+// decision, so an out-of-tolerance correction can never leave a review-ready
+// case (or vice versa). Sealed cases and cases without a current reading
+// cannot be replaced.
 func (c *VerificationCase) ReplaceMeasurement(measurementID string, accepted bool, at time.Time) error {
 	if c.State == CaseSealed {
 		return fmt.Errorf("%w: a sealed case cannot accept a replacement", ErrStateConflict)
@@ -92,12 +97,6 @@ func (c *VerificationCase) ReplaceMeasurement(measurementID string, accepted boo
 	}
 	c.adoptReading(measurementID, accepted, at)
 	return nil
-}
-
-func (c *VerificationCase) AttachReading(measurementID string, at time.Time) {
-	c.ActiveMeasurementID = strings.TrimSpace(measurementID)
-	c.Version++
-	c.UpdatedAt = at.UTC()
 }
 
 func (c *VerificationCase) adoptReading(measurementID string, accepted bool, at time.Time) {
